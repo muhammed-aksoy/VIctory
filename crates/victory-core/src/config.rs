@@ -211,7 +211,12 @@ mod tests {
             test_titles: vec!["from-file".into()],
             ..Default::default()
         };
-        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
+        let local_app_data = std::env::temp_dir().into_os_string();
+        let env = |k: &str| match k {
+            "LOCALAPPDATA" => Some(local_app_data.clone()),
+            "VICTORY_TEST_TITLES" => Some(OsString::new()),
+            _ => None,
+        };
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
     }
@@ -220,7 +225,12 @@ mod tests {
     fn test_titles_env_splits_paths() {
         let value = std::env::join_paths(["first", "second"]).unwrap();
         let file = FilePaths::default();
-        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
+        let local_app_data = std::env::temp_dir().into_os_string();
+        let env = |k: &str| match k {
+            "LOCALAPPDATA" => Some(local_app_data.clone()),
+            "VICTORY_TEST_TITLES" => Some(value.clone()),
+            _ => None,
+        };
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(
             cfg.test_titles,
