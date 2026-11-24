@@ -4,6 +4,7 @@
 //! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
 //! See `victory.example.toml` at the repository root.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -87,10 +88,10 @@ impl Config {
         };
         let cache_dir = env_path("VICTORY_CACHE_DIR")
             .or(file.cache_dir)
-            .map_or_else(|| default_dir("cache"), Ok)?;
+            .map_or_else(|| default_cache_dir(&env), Ok)?;
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
-            .map_or_else(|| default_dir("data"), Ok)?;
+            .map_or_else(|| default_data_dir(&env), Ok)?;
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
@@ -126,14 +127,27 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache).
-fn default_dir(name: &str) -> Result<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
+/// `%LOCALAPPDATA%/victory/cache` on Windows; else XDG cache or home cache.
+fn default_cache_dir(env: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf> {
+    let base = env("LOCALAPPDATA")
+        .or_else(|| env("XDG_CACHE_HOME"))
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
-    Ok(base.join("victory").join(name))
+    Ok(base.join("victory").join("cache"))
+}
+
+/// `%LOCALAPPDATA%/victory/data` on Windows; `$XDG_DATA_HOME` else
+/// `$HOME/.local/share` elsewhere. Deliberately never under the cache root.
+fn default_data_dir(env: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf> {
+    let base = env("LOCALAPPDATA")
+        .or_else(|| env("XDG_DATA_HOME"))
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+        .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
+    Ok(base.join("victory").join("data"))
 }
 
 #[cfg(test)]
@@ -142,13 +156,35 @@ mod tests {
     use std::ffi::OsString;
 
     #[test]
+    fn data_dir_not_under_cache_without_localappdata() {
+        let env = |k: &str| match k {
+            "LOCALAPPDATA" => None,
+            "XDG_CACHE_HOME" => Some(OsString::from("/tmp/probe-home/.cache")),
+            "HOME" => Some(OsString::from("/tmp/probe-home")),
+            _ => None,
+        };
+        let cache = default_cache_dir(&env).unwrap();
+        let data = default_data_dir(&env).unwrap();
+        assert_eq!(cache, PathBuf::from("/tmp/probe-home/.cache/victory/cache"));
+        assert_eq!(
+            data,
+            PathBuf::from("/tmp/probe-home/.local/share/victory/data")
+        );
+        assert!(!data.starts_with("/tmp/probe-home/.cache"));
+    }
+
+    #[test]
     fn environment_overrides_file() {
         let file = FilePaths {
             game_dir: Some("from-file".into()),
             cache_dir: Some("cache-from-file".into()),
             ..Default::default()
         };
-        let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
+        let env = |k: &str| match k {
+            "VICTORY_GAME_DIR" => Some(OsString::from("from-env")),
+            "HOME" => Some(OsString::from("/tmp/probe-home")),
+            _ => None,
+        };
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
@@ -160,7 +196,11 @@ mod tests {
             game_dir: Some("from-file".into()),
             ..Default::default()
         };
-        let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
+        let env = |k: &str| match k {
+            "VICTORY_GAME_DIR" => Some(OsString::new()),
+            "HOME" => Some(OsString::from("/tmp/probe-home")),
+            _ => None,
+        };
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
     }
@@ -171,7 +211,12 @@ mod tests {
             test_titles: vec!["from-file".into()],
             ..Default::default()
         };
-        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
+        let local_app_data = std::env::temp_dir().into_os_string();
+        let env = |k: &str| match k {
+            "LOCALAPPDATA" => Some(local_app_data.clone()),
+            "VICTORY_TEST_TITLES" => Some(OsString::new()),
+            _ => None,
+        };
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
     }
@@ -180,7 +225,12 @@ mod tests {
     fn test_titles_env_splits_paths() {
         let value = std::env::join_paths(["first", "second"]).unwrap();
         let file = FilePaths::default();
-        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
+        let local_app_data = std::env::temp_dir().into_os_string();
+        let env = |k: &str| match k {
+            "LOCALAPPDATA" => Some(local_app_data.clone()),
+            "VICTORY_TEST_TITLES" => Some(value.clone()),
+            _ => None,
+        };
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(
             cfg.test_titles,

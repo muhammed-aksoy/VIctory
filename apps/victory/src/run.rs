@@ -4,6 +4,26 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+/// Debugging aids that write game-derived data (frames, title audio, XMA
+/// input) to a path named in the environment.
+const DUMP_PATHS: [&str; 3] = [
+    "VICTORY_CAPTURE",
+    "VICTORY_AUDIO_CAPTURE",
+    "VICTORY_XMA_DUMP",
+];
+
+/// Refuses a [`DUMP_PATHS`] variable that points into the repository
+/// (rule #1), before the title can write anything there. `var` reads the
+/// environment.
+fn check_dump_paths(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<()> {
+    for name in DUMP_PATHS {
+        if let Some(path) = var(name) {
+            victory_core::ensure_outside_repo(Path::new(&path)).context(name)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -16,6 +36,7 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    check_dump_paths(|name| std::env::var_os(name))?;
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
@@ -329,6 +350,45 @@ mod tests {
         });
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod dump_path_tests {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use super::{DUMP_PATHS, check_dump_paths};
+
+    fn refused(name: &str, path: &Path) -> bool {
+        let result = check_dump_paths(|n| (n == name).then(|| path.as_os_str().to_owned()));
+        let err = match result {
+            Ok(()) => return false,
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains(name), "{err:#}");
+        matches!(
+            err.downcast_ref(),
+            Some(victory_core::PolicyError::InsideRepo { .. })
+        )
+    }
+
+    #[test]
+    fn dump_paths_inside_the_repo_are_refused() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for name in DUMP_PATHS {
+            assert!(refused(name, &repo.join("frames")), "{name}");
+            assert!(refused(name, &repo.join("audio.wav")), "{name}");
+        }
+    }
+
+    #[test]
+    fn dump_paths_outside_the_repo_and_unset_ones_pass() {
+        let outside = std::env::temp_dir().join("victory-dump-path-test");
+        for name in DUMP_PATHS {
+            assert!(!refused(name, &outside), "{name}");
+        }
+        check_dump_paths(|_| None::<OsString>).unwrap();
     }
 }
 

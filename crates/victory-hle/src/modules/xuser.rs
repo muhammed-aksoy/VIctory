@@ -1,7 +1,7 @@
 //! XUser: one offline local user, signed in, never a guest, with every
 //! privilege. Served as the user provider's objects from `QueryApiImpl`;
-//! adding a user completes through `xasync` like any other async call. No
-//! input device is associated with the user (there are none, `gameinput`).
+//! adding a user completes through `xasync` like any other async call. Every
+//! non-null input device (`gameinput`) maps to this single offline local user.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
@@ -262,9 +262,15 @@ extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
     true
 }
 
-/// No input device belongs to a user.
-extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Handle) -> HRESULT {
-    USER_NOT_FOUND
+/// Every valid (non-null, non-zero) `APP_LOCAL_DEVICE_ID` belongs to the
+/// single signed-in offline local user.
+extern "system" fn find_for_device(_: This, device: *const c_void, out: *mut Handle) -> HRESULT {
+    if device.is_null() || out.is_null() {
+        return xasync::E_INVALIDARG;
+    }
+    // SAFETY: checked non-null; the title passes an APP_LOCAL_DEVICE_ID (32 bytes).
+    let id = unsafe { &*device.cast::<[u8; 32]>() };
+    found(*id != [0u8; 32], out)
 }
 
 // Unset slots (no title seen calls them): maximum users, gamer pictures,
@@ -420,6 +426,39 @@ mod tests {
         assert_eq!(
             xasync::XAsyncGetStatus(&mut block, true),
             FAILED_TO_GET_TOKEN
+        );
+    }
+
+    #[test]
+    fn find_for_device_returns_user_for_valid_device_ids() {
+        type FindForDevice = extern "system" fn(This, *const c_void, *mut Handle) -> HRESULT;
+        let find = slot::<FindForDevice>(&DEVICE_OBJECT, 0x18);
+        let this: This = &DEVICE_OBJECT;
+
+        let mut device_id = [0u8; 32];
+        device_id[..7].copy_from_slice(b"victory");
+        device_id[31] = 1;
+        let mut handle = std::ptr::null();
+        assert_eq!(find(this, device_id.as_ptr().cast(), &mut handle), S_OK);
+        assert_eq!(handle, user());
+
+        // All-zero APP_LOCAL_DEVICE_ID (XUserNullDeviceId) has no user.
+        let zero_id = [0u8; 32];
+        let mut not_found = std::ptr::null();
+        assert_eq!(
+            find(this, zero_id.as_ptr().cast(), &mut not_found),
+            USER_NOT_FOUND
+        );
+        assert!(not_found.is_null());
+
+        // Null pointers are rejected with E_INVALIDARG.
+        assert_eq!(
+            find(this, std::ptr::null(), &mut not_found),
+            xasync::E_INVALIDARG
+        );
+        assert_eq!(
+            find(this, device_id.as_ptr().cast(), std::ptr::null_mut()),
+            xasync::E_INVALIDARG
         );
     }
 }

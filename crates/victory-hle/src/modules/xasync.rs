@@ -10,11 +10,12 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::{Ordering as CmpOrdering, Reverse};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
 
@@ -148,42 +149,207 @@ impl Port {
 }
 
 /// The thread pool behind thread-pool ports: idle workers are reused, and a
-/// new one starts whenever more tasks wait than workers idle, so a callback
-/// that blocks on another never starves it. Workers stay for reuse.
-struct Pool {
-    /// Queued tasks and the number of idle workers.
-    state: Mutex<(VecDeque<Task>, usize)>,
-    ready: Condvar,
+/// new one starts whenever more tasks wait than workers idle (up to
+/// `max_workers`), so a callback that blocks on another does not starve it
+/// while bursts cannot spawn unbounded OS threads.
+struct PoolState {
+    tasks: VecDeque<Task>,
+    idle: usize,
+    workers: usize,
+    stopped: bool,
 }
 
-static POOL: Pool = Pool {
-    state: Mutex::new((VecDeque::new(), 0)),
-    ready: Condvar::new(),
-};
+struct Pool {
+    state: Mutex<PoolState>,
+    ready: Condvar,
+    max_workers: usize,
+}
+
+fn default_max_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(8, |n| n.get())
+        .saturating_mul(2)
+        .clamp(8, 64)
+}
+
+static POOL: LazyLock<Arc<Pool>> = LazyLock::new(|| Pool::new(default_max_workers()));
 
 impl Pool {
-    fn submit(&'static self, task: Task) {
+    fn new(max_workers: usize) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(PoolState {
+                tasks: VecDeque::new(),
+                idle: 0,
+                workers: 0,
+                stopped: false,
+            }),
+            ready: Condvar::new(),
+            max_workers: max_workers.max(1),
+        })
+    }
+
+    fn submit(self: &Arc<Self>, task: Task) {
         let mut state = lock(&self.state);
-        state.0.push_back(task);
-        if state.0.len() > state.1 {
-            std::thread::spawn(move || self.work());
-        } else {
+        state.tasks.push_back(task);
+        if state.idle > 0 {
             self.ready.notify_one();
+        }
+        if state.tasks.len() > state.idle && state.workers < self.max_workers {
+            state.workers += 1;
+            let pool = self.clone();
+            if std::thread::Builder::new()
+                .name("victory-xasync-pool".into())
+                .spawn(move || pool.work())
+                .is_err()
+            {
+                state.workers -= 1;
+            }
         }
     }
 
-    fn work(&self) {
+    fn work(self: Arc<Self>) {
         let mut state = lock(&self.state);
         loop {
-            while state.0.is_empty() {
-                state.1 += 1;
+            while state.tasks.is_empty() {
+                if state.stopped {
+                    state.workers = state.workers.saturating_sub(1);
+                    return;
+                }
+                state.idle += 1;
                 state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
-                state.1 -= 1;
+                state.idle -= 1;
             }
-            let task = state.0.pop_front();
+            let task = state.tasks.pop_front();
             drop(state);
             if let Some(task) = task {
                 task.run(false);
+            }
+            state = lock(&self.state);
+        }
+    }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        lock(&self.state).workers
+    }
+
+    #[cfg(test)]
+    fn stop(&self) {
+        let mut state = lock(&self.state);
+        state.stopped = true;
+        self.ready.notify_all();
+    }
+}
+
+struct DelayedTask {
+    due: Instant,
+    seq: u64,
+    queue: Arc<Queue>,
+    port: u32,
+    task: Task,
+}
+
+impl PartialEq for DelayedTask {
+    fn eq(&self, other: &Self) -> bool {
+        (self.due, self.seq) == (other.due, other.seq)
+    }
+}
+
+impl Eq for DelayedTask {}
+
+impl PartialOrd for DelayedTask {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DelayedTask {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        (self.due, self.seq).cmp(&(other.due, other.seq))
+    }
+}
+
+struct TimerState {
+    heap: BinaryHeap<Reverse<DelayedTask>>,
+    next_seq: u64,
+    started: bool,
+}
+
+/// Shared timer wheel for delayed `XTaskQueue` callbacks: one lazily started
+/// thread serves every delayed submission instead of spawning an OS thread per
+/// callback.
+struct Timer {
+    state: Mutex<TimerState>,
+    wake: Condvar,
+}
+
+static TIMER: Timer = Timer {
+    state: Mutex::new(TimerState {
+        heap: BinaryHeap::new(),
+        next_seq: 0,
+        started: false,
+    }),
+    wake: Condvar::new(),
+};
+
+impl Timer {
+    fn schedule(&'static self, queue: Arc<Queue>, port: u32, delay_ms: u32, task: Task) {
+        let due = Instant::now() + Duration::from_millis(delay_ms.into());
+        let mut state = lock(&self.state);
+        if !state.started {
+            state.started = true;
+            if std::thread::Builder::new()
+                .name("victory-xasync-timer".into())
+                .spawn(move || self.run())
+                .is_err()
+            {
+                state.started = false;
+                drop(state);
+                queue.deliver(port, task);
+                return;
+            }
+        }
+        let seq = state.next_seq;
+        state.next_seq = state.next_seq.wrapping_add(1);
+        let earlier = state
+            .heap
+            .peek()
+            .is_none_or(|Reverse(top)| (due, seq) < (top.due, top.seq));
+        state.heap.push(Reverse(DelayedTask {
+            due,
+            seq,
+            queue,
+            port,
+            task,
+        }));
+        if earlier {
+            self.wake.notify_one();
+        }
+    }
+
+    fn run(&'static self) {
+        let mut state = lock(&self.state);
+        loop {
+            let Some(Reverse(top)) = state.heap.peek() else {
+                state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
+            let now = Instant::now();
+            if top.due > now {
+                let wait = top.due - now;
+                state = self
+                    .wake
+                    .wait_timeout(state, wait)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+                continue;
+            }
+            let Some(Reverse(item)) = state.heap.pop() else {
+                continue;
+            };
+            drop(state);
+            if !item.queue.terminated.load(Ordering::Acquire) {
+                item.queue.deliver(item.port, item.task);
             }
             state = lock(&self.state);
         }
@@ -217,11 +383,7 @@ impl Queue {
         if delay_ms == 0 {
             self.deliver(port, task);
         } else {
-            let queue = self.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(delay_ms.into()));
-                queue.deliver(port, task);
-            });
+            TIMER.schedule(self.clone(), port, delay_ms, task);
         }
         S_OK
     }
@@ -1333,5 +1495,79 @@ mod tests {
             E_ABORT
         );
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn delayed_callbacks_fire_in_deadline_order_on_shared_timer() {
+        static ORDER: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        extern "system" fn record(context: *mut c_void, canceled: bool) {
+            if !canceled {
+                lock(&ORDER).push(context as u32);
+            }
+        }
+        lock(&ORDER).clear();
+
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        // Submit out of deadline order: 70 ms, 15 ms, 40 ms.
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,
+                WORK,
+                70,
+                std::ptr::without_provenance_mut(3),
+                Some(record),
+            ),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,
+                WORK,
+                15,
+                std::ptr::without_provenance_mut(1),
+                Some(record),
+            ),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,
+                WORK,
+                40,
+                std::ptr::without_provenance_mut(2),
+                Some(record),
+            ),
+            S_OK
+        );
+        for _ in 0..3 {
+            assert!(XTaskQueueDispatch(q, WORK, 2000));
+        }
+        assert_eq!(*lock(&ORDER), vec![1, 2, 3]);
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn thread_pool_caps_worker_growth_and_drains_burst() {
+        static DONE: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn slow_inc(_: *mut c_void, _: bool) {
+            std::thread::sleep(Duration::from_millis(2));
+            DONE.fetch_add(1, Ordering::SeqCst);
+        }
+        DONE.store(0, Ordering::SeqCst);
+
+        let pool = Pool::new(3);
+        let total = 18u32;
+        for _ in 0..total {
+            pool.submit(Task::new(std::ptr::null_mut(), slow_inc));
+        }
+        let start = Instant::now();
+        while DONE.load(Ordering::SeqCst) < total && start.elapsed().as_secs() < 5 {
+            assert!(pool.worker_count() <= 3);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(DONE.load(Ordering::SeqCst), total);
+        assert!(pool.worker_count() <= 3);
+        pool.stop();
     }
 }
