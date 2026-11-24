@@ -17,16 +17,13 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_FREE,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
-use windows_sys::Win32::System::ProcessStatus::{
-    K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
-    PROCESS_MEMORY_COUNTERS,
-};
+use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
@@ -49,6 +46,103 @@ pub(crate) fn on_wine() -> bool {
 
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
+/// Bytes currently live in [`XMemAllocDefault`] heap blocks (all and GPU-optimal).
+static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
+static HEAP_GPU_OPTIMAL_USED: AtomicUsize = AtomicUsize::new(0);
+/// Non-placeholder [`XMemVirtualAlloc`] reservations: base -> (length, gpu_optimal).
+/// Queried for committed pages when reporting working-set statistics so host
+/// allocations (GPU mirrors, shader compiler) are excluded and `VirtualFree`
+/// decommits/releases are observed automatically.
+static VIRTUAL_REGIONS: LazyLock<Mutex<BTreeMap<usize, (usize, bool)>>> =
+    LazyLock::new(Default::default);
+
+fn saturating_sub(counter: &AtomicUsize, delta: usize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        Some(cur.saturating_sub(delta))
+    });
+}
+
+fn record_virtual_region(at: usize, requested: usize, gpu_optimal: bool) {
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: pseudo-handle and writable MEMORY_BASIC_INFORMATION.
+    let queried = unsafe {
+        VirtualQueryEx(
+            GetCurrentProcess(),
+            at as *const c_void,
+            &mut mbi,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    let len = if queried != 0 && mbi.RegionSize > 0 {
+        mbi.RegionSize.max(requested)
+    } else {
+        requested
+    };
+    let end = at.saturating_add(len);
+    let mut regions = VIRTUAL_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    // Drop any stale entry overlapping `[at, end)` (e.g. reused after VirtualFree).
+    let stale: Vec<usize> = regions
+        .iter()
+        .filter(|&(&base, &(rlen, _))| base < end && base.saturating_add(rlen) > at)
+        .map(|(&base, _)| base)
+        .collect();
+    for base in stale {
+        regions.remove(&base);
+    }
+    regions.insert(at, (len, gpu_optimal));
+}
+
+fn virtual_used() -> (usize, usize) {
+    let mut regions = VIRTUAL_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut total = 0usize;
+    let mut gpu_optimal = 0usize;
+    let mut stale = Vec::new();
+    // SAFETY: pseudo-handle needs no closing.
+    let process = unsafe { GetCurrentProcess() };
+    for (&base, &(len, is_gpu)) in regions.iter() {
+        let end = base.saturating_add(len);
+        let mut cur = base;
+        let mut alive = false;
+        while cur < end {
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: valid process handle and writable struct.
+            let ok = unsafe {
+                VirtualQueryEx(
+                    process,
+                    cur as *const c_void,
+                    &mut mbi,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if ok == 0 || mbi.RegionSize == 0 {
+                break;
+            }
+            let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+            let next = region_end.min(end);
+            if next <= cur {
+                break;
+            }
+            if mbi.State != MEM_FREE && mbi.AllocationBase as usize == base {
+                alive = true;
+                if mbi.State == MEM_COMMIT {
+                    let bytes = next - cur;
+                    total = total.saturating_add(bytes);
+                    if is_gpu {
+                        gpu_optimal = gpu_optimal.saturating_add(bytes);
+                    }
+                }
+            }
+            cur = next;
+        }
+        if !alive {
+            stale.push(base);
+        }
+    }
+    for base in stale {
+        regions.remove(&base);
+    }
+    (total, gpu_optimal)
+}
 
 // Console additions to the host's flags.
 /// 2 MiB pages; the host reads this bit as large pages, which need a
@@ -153,6 +247,19 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() && !placeholder {
+        let addr = at as usize;
+        let already_tracked = !constrained && {
+            let regions = VIRTUAL_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+            regions
+                .range(..=addr)
+                .next_back()
+                .is_some_and(|(&rbase, &(rlen, _))| addr < rbase.saturating_add(rlen))
+        };
+        if !already_tracked {
+            record_virtual_region(addr, size, flags & GRAPHICS != 0);
+        }
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -204,12 +311,20 @@ pub extern "system" fn XMemVirtualQuery(
 }
 
 // `XMemAlloc` attributes: alignment as log2 (5 bits at 24, 4 bytes and up
-// from 2), then the memory type, then bit 33: a 32-bit address.
+// from 2), then the memory type (4 bits at 29; non-zero = graphics/GPU),
+// then bit 33: a 32-bit address.
 const ALIGNMENT_SHIFT: u64 = 24;
+const ALLOC_TYPE_SHIFT: u64 = 29;
+const ALLOC_TYPE_MASK: u64 = 0xf;
 const ALLOC_32BIT: u64 = 1 << 33;
-/// Our block header: the block's size and alignment, just below the
-/// pointer handed out.
+/// Our block header: the block's size and alignment (bit 0 packs `gpu_optimal`,
+/// since alignment is always a power of two >= 16), just below the pointer
+/// handed out.
 const HEADER: usize = 2 * size_of::<usize>();
+
+fn is_alloc_gpu_optimal(attributes: u64) -> bool {
+    ((attributes >> ALLOC_TYPE_SHIFT) & ALLOC_TYPE_MASK) != 0
+}
 
 fn layout(size: usize, attributes: u64) -> Option<Layout> {
     // An alignment of at least 16 leaves room for the header.
@@ -298,13 +413,18 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     if block.is_null() {
         return block.cast();
     }
+    let gpu_optimal = is_alloc_gpu_optimal(attributes);
+    HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed);
+    if gpu_optimal {
+        HEAP_GPU_OPTIMAL_USED.fetch_add(layout.size(), Ordering::Relaxed);
+    }
     // SAFETY: the block holds the alignment (at least the header) and then
-    // `size` bytes.
+    // `size` bytes. Alignment is a power of two >= 16 so bit 0 is free.
     unsafe {
         let user = block.add(layout.align());
         user.sub(HEADER)
             .cast::<[usize; 2]>()
-            .write([layout.size(), layout.align()]);
+            .write([layout.size(), layout.align() | usize::from(gpu_optimal)]);
         user.cast()
     }
 }
@@ -318,15 +438,25 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            VIRTUAL_REGIONS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(address as usize));
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
-        let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        let [size, packed_align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        let gpu_optimal = (packed_align & 1) != 0;
+        let align = packed_align & !1;
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
         );
+        saturating_sub(&HEAP_USED, size);
+        if gpu_optimal {
+            saturating_sub(&HEAP_GPU_OPTIMAL_USED, size);
+        }
     }
 }
 
@@ -342,7 +472,10 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section {
+    handle: HANDLE,
+    gpu_optimal: bool,
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -352,7 +485,7 @@ unsafe impl Sync for Section {}
 impl Drop for Section {
     fn drop(&mut self) {
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -368,6 +501,7 @@ struct Slice {
 struct Physical {
     next_page: usize,
     pages: HashMap<usize, Slice>,
+    gpu_optimal_pages: usize,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
 }
@@ -428,10 +562,17 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
+    let gpu_optimal = flags & GRAPHICS != 0;
+    let section = Arc::new(Section {
+        handle,
+        gpu_optimal,
+    });
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
+    if gpu_optimal {
+        physical.gpu_optimal_pages = physical.gpu_optimal_pages.saturating_add(n);
+    }
     for index in 0..n {
         let slice = Slice {
             section: section.clone(),
@@ -458,7 +599,11 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        if let Some(slice) = physical.pages.remove(&unsafe { *pages.add(i) })
+            && slice.section.gpu_optimal
+        {
+            physical.gpu_optimal_pages = physical.gpu_optimal_pages.saturating_sub(1);
+        }
     }
     1
 }
@@ -478,7 +623,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -701,7 +846,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -846,26 +991,34 @@ pub struct WorkingSet {
     pub kernel_pool_limit: u32,
 }
 
-/// The title's budget and our process's commit as what it uses. No tools
-/// memory: a retail console.
-// shortcut: all fields are filled whatever the flags ask for, and use is
-// not split by bandwidth class (GPU-optimal use reads 0); track
-// allocations per class if a title budgets from that field.
+/// The title's budget and its tracked allocations (`XMemAllocDefault`,
+/// committed `XMemVirtualAlloc` regions, and allocated physical pages),
+/// excluding host-side allocations such as D3D12 mirrors and shader compiler
+/// memory. No tools memory: a retail console.
 pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
     if out.is_null() {
         return 0;
     }
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
+    let (virt_total, virt_gpu) = virtual_used();
+    let (phys_pages, phys_gpu_pages) = {
+        let physical = physical();
+        (physical.pages.len(), physical.gpu_optimal_pages)
     };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    let heap_total = HEAP_USED.load(Ordering::Relaxed);
+    let heap_gpu = HEAP_GPU_OPTIMAL_USED.load(Ordering::Relaxed);
+    let title_used = virt_total
+        .saturating_add(phys_pages.saturating_mul(PAGE))
+        .saturating_add(heap_total);
+    let gpu_optimal_used = virt_gpu
+        .saturating_add(phys_gpu_pages.saturating_mul(PAGE))
+        .saturating_add(heap_gpu);
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_used,
+        physical_pages: u32::try_from(phys_pages).unwrap_or(u32::MAX),
         gpu_optimal_limit: gpu_optimal,
+        gpu_optimal_used,
         ..Default::default()
     };
     // SAFETY: checked non-null; the title passes room for the structure.
@@ -998,7 +1151,7 @@ mod tests {
     fn transfers_shrink_the_title_budget() {
         let mut before = WorkingSet::default();
         assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut before), 1);
-        assert!(before.title_used > 0);
+        assert!(before.title_limit > 0);
         assert_eq!(XMemTransferMemory(0, 128 * MIB - 1), 1);
         assert_eq!(XMemTransferMemory(2, MIB), 0, "no tools memory");
         let standard = victory_gpu::console::current().title_memory().1;
@@ -1006,6 +1159,89 @@ mod tests {
         let mut after = WorkingSet::default();
         XMemGetWorkingSetStatistics(0x2000_0001, &mut after);
         assert_eq!(before.title_limit - after.title_limit, 128 * MIB);
+    }
+
+    #[test]
+    fn working_set_tracks_title_allocations_and_excludes_host_memory() {
+        let stats = || {
+            let mut ws = WorkingSet::default();
+            assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut ws), 1);
+            ws
+        };
+
+        // Host allocations (mirrors, shader compiler) must not inflate title_used.
+        let before_host = stats();
+        let mut host_buf = vec![0u8; 32 * MIB];
+        for page in host_buf.chunks_mut(4096) {
+            page[0] = 1;
+        }
+        std::hint::black_box(&host_buf);
+        let after_host = stats();
+        assert!(
+            after_host.title_used < before_host.title_used + 16 * MIB,
+            "host memory should not be counted in title_used: before={} after={}",
+            before_host.title_used,
+            after_host.title_used
+        );
+        drop(host_buf);
+
+        // Uncommitted virtual reservations count 0; committing adds exact bytes;
+        // VirtualFree(MEM_RELEASE) subtracts them automatically.
+        let before_virt = stats();
+        let virt = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            16 * MIB,
+            MEM_RESERVE,
+            GRAPHICS,
+            PAGE_NOACCESS,
+        );
+        assert!(!virt.is_null());
+        let after_reserve = stats();
+        assert!(
+            after_reserve.title_used < before_virt.title_used + 8 * MIB,
+            "uncommitted reserve should not be counted"
+        );
+        let committed = XMemVirtualAlloc(virt, 16 * MIB, MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
+        assert_eq!(committed, virt);
+        let after_commit = stats();
+        assert!(after_commit.title_used >= before_virt.title_used + 12 * MIB);
+        assert!(after_commit.gpu_optimal_used >= before_virt.gpu_optimal_used + 12 * MIB);
+        // SAFETY: our reservation from above.
+        assert_ne!(unsafe { VirtualFree(virt, 0, MEM_RELEASE) }, 0);
+        let after_release = stats();
+        assert!(after_release.title_used + 10 * MIB <= after_commit.title_used);
+        assert!(after_release.gpu_optimal_used + 10 * MIB <= after_commit.gpu_optimal_used);
+
+        // XMemAllocDefault tracks standard vs GPU-optimal allocations and frees.
+        let before_heap = stats();
+        let std_blk = XMemAllocDefault(16 * MIB, 0);
+        let gpu_blk = XMemAllocDefault(16 * MIB, 1 << ALLOC_TYPE_SHIFT);
+        assert!(!std_blk.is_null() && !gpu_blk.is_null());
+        let after_heap = stats();
+        assert!(after_heap.title_used >= before_heap.title_used + 28 * MIB);
+        assert!(after_heap.gpu_optimal_used >= before_heap.gpu_optimal_used + 12 * MIB);
+        assert!(after_heap.gpu_optimal_used < before_heap.gpu_optimal_used + 24 * MIB);
+        XMemFreeDefault(std_blk, 0);
+        XMemFreeDefault(gpu_blk, 0);
+        let after_heap_free = stats();
+        assert!(after_heap_free.title_used + 24 * MIB <= after_heap.title_used);
+        assert!(after_heap_free.gpu_optimal_used + 10 * MIB <= after_heap.gpu_optimal_used);
+
+        // Physical pages track total count, title_used, and gpu_optimal_used.
+        let before_phys = stats();
+        let mut pages = [0usize; 64];
+        let mut count = pages.len();
+        assert_eq!(
+            XMemAllocatePhysicalPages(GRAPHICS, &mut count, pages.as_mut_ptr()),
+            1
+        );
+        assert_eq!(count, 64);
+        let after_phys = stats();
+        assert!(after_phys.physical_pages >= before_phys.physical_pages + 50);
+        assert!(after_phys.gpu_optimal_used >= before_phys.gpu_optimal_used + 3 * MIB);
+        assert_eq!(XMemFreePhysicalPages(count, pages.as_ptr()), 1);
+        let after_phys_free = stats();
+        assert!(after_phys_free.physical_pages + 50 <= after_phys.physical_pages);
     }
 
     #[test]
