@@ -7547,7 +7547,7 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
-    } 
+    }
     #[test]
     fn image_atomics_64_bit_lower_with_typed_int64_flag() {
         use crate::native::{RootParam, RootType};
@@ -7588,7 +7588,7 @@ mod tests {
                 code,
             };
             let p = ir::build(&native.code, false, 8).unwrap();
-            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
             let io = io::raise(&p, &native).unwrap();
             let st = structure::structure(&p).unwrap();
             lower(&Parts {

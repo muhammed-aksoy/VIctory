@@ -822,7 +822,7 @@ mod tests {
                 crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
             let c = Container::parse(&bytes).unwrap();
             let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
             let io = io::raise(&p, &native).unwrap();
             let st = structure::structure(&p).unwrap();
             let mut host = emit(&c, &native, &p, &st, &io, &res).unwrap();
